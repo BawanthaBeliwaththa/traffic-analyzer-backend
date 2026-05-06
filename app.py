@@ -4,8 +4,6 @@ import numpy as np
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from datetime import datetime
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.preprocessing import StandardScaler
 import joblib
 import warnings
 warnings.filterwarnings('ignore')
@@ -48,85 +46,65 @@ SRI_LANKA_CITIES = [
 ]
 
 # ============================================
-# LOAD DATA AND TRAIN MODEL
+# LOAD PRE-TRAINED MODEL
 # ============================================
-print("🚀 Starting Traffic Prediction API...")
-print("📂 Loading data...")
+print("🚀 Loading model...")
 
-# Try to load the CSV from multiple possible locations
-possible_paths = [
-    'https://www.kaggle.com/datasets/bawanthabeliwaththa/traffic-data/traffic_data_1million.csv',
-    'data/traffic_data_1million.csv',
-    '/app/traffic_data_1million.csv',
-    '/app/data/traffic_data_1million.csv'
+model = None
+scaler = None
+
+# Try multiple paths for model files
+model_paths = [
+    ('models/traffic_model.pkl', 'models/scaler.pkl'),
+    ('/app/models/traffic_model.pkl', '/app/models/scaler.pkl'),
+    ('traffic_model.pkl', 'scaler.pkl'),
 ]
 
-df = None
-for path in possible_paths:
-    if os.path.exists(path):
-        df = pd.read_csv(path)
-        print(f"✅ Loaded data from: {path}")
+for model_path, scaler_path in model_paths:
+    if os.path.exists(model_path) and os.path.exists(scaler_path):
+        model = joblib.load(model_path)
+        scaler = joblib.load(scaler_path)
+        print(f"✅ Model loaded from: {model_path}")
         break
 
-if df is None:
-    print("❌ Could not find traffic_data_1million.csv")
-    print("📁 Current directory contents:")
-    for root, dirs, files in os.walk('.'):
-        for file in files:
-            print(f"   {os.path.join(root, file)}")
-    raise FileNotFoundError("traffic_data_1million.csv not found")
+if model is None:
+    print("⚠️ Pre-trained model not found, training on startup...")
+    # Fallback: train quickly with sample
+    import pandas as pd
+    from sklearn.ensemble import RandomForestRegressor
+    from sklearn.preprocessing import StandardScaler
+    
+    df = pd.read_csv('traffic_data_1million.csv')
+    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    df['hour'] = df['timestamp'].dt.hour
+    df['day_of_week'] = df['timestamp'].dt.dayofweek
+    df['month'] = df['timestamp'].dt.month
+    df['is_weekend'] = (df['day_of_week'] >= 5).astype(int)
+    df['is_peak'] = df['hour'].isin([7, 8, 9, 16, 17, 18, 19]).astype(int)
+    
+    mapping = {'flowing': 0.3, 'moderate': 0.6, 'congested': 0.85}
+    df['congestion'] = df['congestion_level'].map(mapping).fillna(0.5)
+    
+    # Use a smaller sample for faster training
+    df_sample = df.sample(n=100000, random_state=42) if len(df) > 100000 else df
+    
+    feature_cols = ['hour', 'day_of_week', 'is_weekend', 'month', 'is_peak']
+    X = df_sample[feature_cols].values
+    y = df_sample['congestion'].values
+    
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    
+    model = RandomForestRegressor(n_estimators=30, max_depth=8, random_state=42, n_jobs=-1)
+    model.fit(X_scaled, y)
+    print("✅ Model trained on startup (fallback)")
 
-print(f"📊 Dataset shape: {df.shape}")
-
-# Preprocess data
-print("🔄 Preprocessing data...")
-df['timestamp'] = pd.to_datetime(df['timestamp'])
-df['hour'] = df['timestamp'].dt.hour
-df['day_of_week'] = df['timestamp'].dt.dayofweek
-df['month'] = df['timestamp'].dt.month
-df['is_weekend'] = (df['day_of_week'] >= 5).astype(int)
-df['is_peak'] = df['hour'].isin([7, 8, 9, 16, 17, 18, 19]).astype(int)
-
-# Create target variable
-congestion_mapping = {'flowing': 0.3, 'moderate': 0.6, 'congested': 0.85}
-df['congestion'] = df['congestion_level'].map(congestion_mapping).fillna(0.5)
-
-# Train model
-print("🤖 Training model...")
-feature_cols = ['hour', 'day_of_week', 'is_weekend', 'month', 'is_peak']
-X = df[feature_cols].values
-y = df['congestion'].values
-
-scaler = StandardScaler()
-X_scaled = scaler.fit_transform(X)
-
-model = RandomForestRegressor(
-    n_estimators=100,
-    max_depth=10,
-    random_state=42,
-    n_jobs=-1
-)
-model.fit(X_scaled, y)
-
-# Save model artifacts
-os.makedirs('models', exist_ok=True)
-joblib.dump(model, 'models/traffic_model.pkl')
-joblib.dump(scaler, 'models/scaler.pkl')
-print("✅ Model trained and saved!")
-
-# Calculate model accuracy
-from sklearn.metrics import mean_absolute_error, r2_score
-y_pred = model.predict(X_scaled)
-mae = mean_absolute_error(y, y_pred)
-r2 = r2_score(y, y_pred)
-print(f"📈 Model Accuracy: {(1 - mae) * 100:.2f}%")
-print(f"📈 R² Score: {r2:.4f}")
+print("✅ API Ready!")
 
 # ============================================
 # PREDICTION FUNCTION
 # ============================================
 def predict_city(city, current_time=None):
-    """Predict traffic congestion for a specific city"""
     if current_time is None:
         current_time = datetime.now()
     
@@ -136,12 +114,10 @@ def predict_city(city, current_time=None):
     month = current_time.month
     is_peak = 1 if hour in [7, 8, 9, 16, 17, 18, 19] else 0
     
-    # Make prediction
     features = np.array([[hour, day, is_weekend, month, is_peak]])
     features_scaled = scaler.transform(features)
     congestion = float(model.predict(features_scaled)[0])
     
-    # Adjust based on city type
     if city["type"] == "capital":
         congestion += 0.1
     elif city["type"] == "tourist" and is_weekend:
@@ -149,7 +125,6 @@ def predict_city(city, current_time=None):
     
     congestion = max(0.05, min(0.95, congestion))
     
-    # Determine congestion level
     if congestion > 0.75:
         level = "congested"
     elif congestion > 0.5:
@@ -157,10 +132,7 @@ def predict_city(city, current_time=None):
     else:
         level = "flowing"
     
-    # Calculate estimated speed
     speed = round(60 - (congestion * 45), 1)
-    
-    # Calculate delay in minutes
     delay = round(congestion * 30, 0)
     
     return {
@@ -186,123 +158,90 @@ def predict_city(city, current_time=None):
 
 @app.route('/', methods=['GET'])
 def home():
-    """Home page with API documentation"""
     return jsonify({
         "name": "Sri Lanka Traffic Prediction API",
         "version": "2.0.0",
-        "description": "Real-time traffic congestion predictions for Sri Lankan cities",
+        "status": "running",
         "endpoints": {
             "health": "/health",
             "all_cities": "/api/all-cities",
-            "specific_city": "/api/city/<city_name>",
+            "city": "/api/city/<name>",
             "summary": "/api/summary",
-            "provinces": "/api/provinces",
-            "search": "/api/search?q=<query>"
+            "provinces": "/api/provinces"
         },
-        "example_cities": ["Colombo", "Kandy", "Galle", "Jaffna"],
         "timestamp": datetime.now().isoformat()
     })
 
 @app.route('/health', methods=['GET'])
 def health():
-    """Health check endpoint"""
     return jsonify({
         "status": "healthy",
         "service": "traffic-prediction-api",
-        "model_accuracy": f"{(1 - mae) * 100:.2f}%",
-        "cities_covered": len(SRI_LANKA_CITIES),
-        "uptime": "running",
+        "cities": len(SRI_LANKA_CITIES),
         "timestamp": datetime.now().isoformat()
     })
 
 @app.route('/api/all-cities', methods=['GET'])
 def get_all_cities():
-    """Get traffic predictions for all cities"""
     current_time = datetime.now()
-    
-    # Optional query parameters
     province_filter = request.args.get('province')
-    type_filter = request.args.get('type')
     
     predictions = [predict_city(city, current_time) for city in SRI_LANKA_CITIES]
     
-    # Apply filters if provided
     if province_filter:
         predictions = [p for p in predictions if p['province'].lower() == province_filter.lower()]
-    if type_filter:
-        predictions = [p for p in predictions if p['type'].lower() == type_filter.lower()]
     
-    # Sort by congestion (highest first)
     predictions.sort(key=lambda x: x["congestion_percent"], reverse=True)
     
     return jsonify({
         "success": True,
-        "total_cities": len(predictions),
+        "total": len(predictions),
         "timestamp": current_time.isoformat(),
         "data": predictions
     })
 
 @app.route('/api/city/<name>', methods=['GET'])
 def get_city(name):
-    """Get traffic prediction for a specific city"""
     current_time = datetime.now()
-    
-    # Search for city (case-insensitive)
     city = next((c for c in SRI_LANKA_CITIES if c["name"].lower() == name.lower()), None)
     
     if not city:
-        # Try partial match
-        matching_cities = [c for c in SRI_LANKA_CITIES if name.lower() in c["name"].lower()]
-        if matching_cities:
-            return jsonify({
-                "success": False,
-                "error": f"City '{name}' not found. Did you mean one of these?",
-                "suggestions": [c["name"] for c in matching_cities]
-            }), 404
-        else:
-            return jsonify({
-                "success": False,
-                "error": f"City '{name}' not found",
-                "available_cities": [c["name"] for c in SRI_LANKA_CITIES]
-            }), 404
+        return jsonify({
+            "success": False,
+            "error": f"City '{name}' not found",
+            "available": [c["name"] for c in SRI_LANKA_CITIES[:10]]
+        }), 404
     
-    prediction = predict_city(city, current_time)
     return jsonify({
         "success": True,
-        "data": prediction
+        "data": predict_city(city, current_time)
     })
 
 @app.route('/api/summary', methods=['GET'])
 def get_summary():
-    """Get traffic summary statistics"""
     current_time = datetime.now()
     predictions = [predict_city(city, current_time) for city in SRI_LANKA_CITIES]
     
     congested = [p for p in predictions if p["level"] == "congested"]
     moderate = [p for p in predictions if p["level"] == "moderate"]
     flowing = [p for p in predictions if p["level"] == "flowing"]
-    
     speeds = [p["speed_kmh"] for p in predictions]
     
     return jsonify({
         "success": True,
         "timestamp": current_time.isoformat(),
         "summary": {
-            "total_cities": len(predictions),
-            "congested_count": len(congested),
-            "moderate_count": len(moderate),
-            "flowing_count": len(flowing),
-            "avg_speed_kmh": round(sum(speeds) / len(speeds), 1),
-            "max_speed_kmh": max(speeds),
-            "min_speed_kmh": min(speeds),
-            "most_congested": congested[:3] if congested else [],
-            "least_congested": flowing[-3:] if flowing else []
+            "total": len(predictions),
+            "congested": len(congested),
+            "moderate": len(moderate),
+            "flowing": len(flowing),
+            "avg_speed": round(sum(speeds) / len(speeds), 1),
+            "most_congested": [c["name"] for c in congested[:3]]
         }
     })
 
 @app.route('/api/provinces', methods=['GET'])
 def get_provinces():
-    """Get traffic summary by province"""
     current_time = datetime.now()
     predictions = [predict_city(city, current_time) for city in SRI_LANKA_CITIES]
     
@@ -310,87 +249,30 @@ def get_provinces():
     for p in predictions:
         province = p["province"]
         if province not in provinces:
-            provinces[province] = {
-                "name": province,
-                "cities": [],
-                "avg_congestion": 0,
-                "avg_speed": 0
-            }
-        provinces[province]["cities"].append({
-            "name": p["name"],
-            "congestion": p["congestion_percent"],
-            "level": p["level"],
-            "speed": p["speed_kmh"]
-        })
+            provinces[province] = {"name": province, "cities": [], "total_congestion": 0}
+        provinces[province]["cities"].append(p["name"])
+        provinces[province]["total_congestion"] += p["congestion_percent"]
     
-    # Calculate averages
-    for province in provinces.values():
-        province["avg_congestion"] = round(
-            sum(c["congestion"] for c in province["cities"]) / len(province["cities"]), 1
-        )
-        province["avg_speed"] = round(
-            sum(c["speed"] for c in province["cities"]) / len(province["cities"]), 1
-        )
-        province["city_count"] = len(province["cities"])
-        province["status"] = "congested" if province["avg_congestion"] > 75 else "moderate" if province["avg_congestion"] > 50 else "flowing"
+    result = []
+    for name, data in provinces.items():
+        count = len(data["cities"])
+        result.append({
+            "name": name,
+            "cities": data["cities"],
+            "city_count": count,
+            "avg_congestion": round(data["total_congestion"] / count, 1),
+            "status": "congested" if data["total_congestion"] / count > 75 else "moderate" if data["total_congestion"] / count > 50 else "flowing"
+        })
     
     return jsonify({
         "success": True,
         "timestamp": current_time.isoformat(),
-        "data": list(provinces.values())
+        "data": result
     })
-
-@app.route('/api/search', methods=['GET'])
-def search():
-    """Search for cities"""
-    query = request.args.get('q', '').lower()
-    
-    if not query:
-        return jsonify({"success": False, "error": "Please provide a search query 'q'"}), 400
-    
-    matching_cities = [
-        city for city in SRI_LANKA_CITIES 
-        if query in city["name"].lower() or query in city["district"].lower() or query in city["province"].lower()
-    ]
-    
-    if not matching_cities:
-        return jsonify({
-            "success": True,
-            "query": query,
-            "total": 0,
-            "message": "No cities found matching your query",
-            "data": []
-        })
-    
-    current_time = datetime.now()
-    predictions = [predict_city(city, current_time) for city in matching_cities]
-    
-    return jsonify({
-        "success": True,
-        "query": query,
-        "total": len(predictions),
-        "data": predictions
-    })
-
-# ============================================
-# ERROR HANDLERS
-# ============================================
 
 @app.errorhandler(404)
 def not_found(error):
-    return jsonify({
-        "success": False,
-        "error": "Endpoint not found",
-        "message": "Check / for available endpoints"
-    }), 404
-
-@app.errorhandler(500)
-def internal_error(error):
-    return jsonify({
-        "success": False,
-        "error": "Internal server error",
-        "message": str(error)
-    }), 500
+    return jsonify({"success": False, "error": "Endpoint not found"}), 404
 
 # ============================================
 # MAIN
@@ -399,6 +281,4 @@ def internal_error(error):
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print(f"\n🚀 Starting server on port {port}...")
-    print(f"📡 API will be available at http://0.0.0.0:{port}")
-    print(f"📖 Check http://0.0.0.0:{port}/ for documentation\n")
     app.run(host='0.0.0.0', port=port, debug=False)
