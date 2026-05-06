@@ -55,7 +55,7 @@ print("📂 Loading data...")
 
 # Try to load the CSV from multiple possible locations
 possible_paths = [
-    'traffic_data_1million.csv',
+    'https://www.kaggle.com/datasets/bawanthabeliwaththa/traffic-data/traffic_data_1million.csv',
     'data/traffic_data_1million.csv',
     '/app/traffic_data_1million.csv',
     '/app/data/traffic_data_1million.csv'
